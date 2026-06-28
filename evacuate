@@ -8,18 +8,19 @@ readonly STATE_ORDER="queued copying copied verified deleted finished"
 DRY_RUN=0; VERIFY_ONLY=0; NONINTERACTIVE=0; YES=0
 SCAN_ROOT=""; DEST=""; TARGET_BYTES=0; MIN_BYTES=0
 MODE="transactional"; ALLOW_CROSS_FS=0; EXCLUSIONS_RAW=""; RESUME_SESSION=""
-DEST_UUID=""; SESSION_DIR=""; LOG_FILE=""
+DEST_UUID=""; SESSION_DIR=""; LOG_FILE=""; TINY_OPT=0
+SELECT_TOTAL=0; SELECT_COUNT=0; SCAN_TOTAL=0; SCAN_COUNT=0; SCAN_DIRS=0; TINY_COUNT=0; TINY_BYTES=0
 
 # ---------- logging ----------
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
-log(){ local msg="$(ts) $*"; printf '%s\n' "$msg" >&2; [[ -n ${LOG_FILE:-} ]] && printf '%s\n' "$msg" >>"$LOG_FILE"; }
+log(){ local msg="$(ts) $*"; printf '%s\n' "$msg" >&2; [[ -n ${LOG_FILE:-} ]] && printf '%s\n' "$msg" >>"$LOG_FILE"; return 0; }
 die(){ log "ERROR $*"; exit 1; }
 
 usage(){ cat <<USAGE
 Usage: $0 [options]
   --root PATH              scan root (required with --non-interactive)
   --dest PATH              mounted removable destination path
-  --target-size BYTES      bytes to evacuate (0 means all candidates)
+  --target-size SIZE       bytes or human size (40G, 120GB; 0 means all candidates)
   --min-size BYTES         minimum file size
   --exclude PATH[,PATH...] excluded directories
   --mode transactional|incremental
@@ -36,7 +37,20 @@ USAGE
 json_escape(){ sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' <<<"$1" | tr -d '\r'; }
 json_string(){ printf '"%s"' "$(json_escape "$1")"; }
 require_cmds(){ local c; for c in "$@"; do command -v "$c" >/dev/null || die "required command missing: $c"; done; }
-bytes_arg(){ [[ ${1:-} =~ ^[0-9]+$ ]] || die "byte value must be an integer: ${1:-}"; printf '%s' "$1"; }
+bytes_arg(){ parse_size "${1:-}"; }
+parse_size(){
+  local v="${1:-}" n u mult=1
+  [[ -n $v ]] || die "size value required"
+  v=${v//[[:space:]]/}; [[ $v =~ ^([0-9]+)([KkMmGgTt]?[Bb]?)?$ ]] || die "invalid size: $1"
+  n=${BASH_REMATCH[1]}; u=${BASH_REMATCH[2],,}
+  case "$u" in ""|b) mult=1;; k|kb) mult=1024;; m|mb) mult=$((1024**2));; g|gb) mult=$((1024**3));; t|tb) mult=$((1024**4));; *) die "invalid size suffix: $1";; esac
+  printf '%s' $((n*mult))
+}
+human_bytes(){ awk -v b="${1:-0}" 'BEGIN{split("B KiB MiB GiB TiB",u); i=1; while(b>=1024 && i<5){b/=1024;i++} printf (i==1?"%.0f %s":"%.1f %s"), b,u[i]}'; }
+yes_no(){ local prompt="$1" ans; while true; do printf '%s\n[Y] Yes\n[N] No\n> ' "$prompt" >&2; read -r ans; case "$ans" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
+rel_path(){ local p="$1"; printf '%s\n' "${p#$SCAN_ROOT/}"; }
+inside_root(){ local p="$1"; [[ $p == "$SCAN_ROOT" || $p == "$SCAN_ROOT"/* ]]; }
+
 new_uuid(){ [[ -r /proc/sys/kernel/random/uuid ]] && cat /proc/sys/kernel/random/uuid || date -u +%s%N | sha256sum | awk '{print substr($1,1,8)"-"substr($1,9,4)"-4"substr($1,14,3)"-a"substr($1,18,3)"-"substr($1,21,12)}'; }
 canon(){ local p="$1"; [[ $p == ~* ]] && p="${HOME}${p#\~}"; [[ -e $p ]] || return 1; (cd -P -- "$p" 2>/dev/null && pwd -P); }
 parent_canon(){ local d b; d=$(dirname -- "$1"); b=$(basename -- "$1"); d=$(canon "$d") || return 1; printf '%s/%s\n' "$d" "$b"; }
@@ -49,7 +63,7 @@ parse_args(){
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --root) SCAN_ROOT=${2:?}; shift 2;; --dest) DEST=${2:?}; shift 2;;
-      --target-size) TARGET_BYTES=$(bytes_arg "${2:?}"); shift 2;; --min-size) MIN_BYTES=$(bytes_arg "${2:?}"); shift 2;;
+      --target-size) TARGET_BYTES=$(parse_size "${2:?}"); shift 2;; --min-size) MIN_BYTES=$(bytes_arg "${2:?}"); shift 2;;
       --exclude) EXCLUSIONS_RAW=${2:?}; shift 2;; --mode) MODE=${2:?}; shift 2;;
       --allow-cross-fs) ALLOW_CROSS_FS=1; shift;; --dry-run) DRY_RUN=1; shift;;
       --verify) VERIFY_ONLY=1; RESUME_SESSION=${2:?}; shift 2;; --resume) RESUME_SESSION=${2:?}; shift 2;;
@@ -71,11 +85,29 @@ choose_root(){
   SCAN_ROOT=$(canon "$SCAN_ROOT") || die "scan root invalid: $SCAN_ROOT"
   [[ -d $SCAN_ROOT && -r $SCAN_ROOT && -x $SCAN_ROOT ]] || die "scan root must be readable/searchable directory"
 }
+storage_mounts(){
+  findmnt -rnP -o TARGET,FSTYPE | while IFS= read -r line; do
+    eval "$line"
+    case "$FSTYPE" in proc|sysfs|tmpfs|devtmpfs|devpts|cgroup|cgroup2|overlay|aufs|squashfs|nsfs|debugfs|tracefs|securityfs|pstore|bpf|autofs|mqueue|hugetlbfs|fusectl|configfs|ramfs) continue;; esac
+    case "$TARGET" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run/docker|/run/docker/*|/var/lib/docker|/var/lib/docker/*|/snap|/snap/*|/tmp|/tmp/*|*/.mount_*) continue;; esac
+    printf '%s\t%s\n' "$TARGET" "$FSTYPE"
+  done
+}
 choose_dest(){
   if [[ -z $DEST ]]; then
     [[ $NONINTERACTIVE -eq 1 ]] && die "--dest required"
-    findmnt -rn -o TARGET,SOURCE,FSTYPE | awk '{print NR ") " $0}' >&2
-    printf 'Destination mount path: ' >&2; read -r DEST
+    local mounts=() line i=0 free name fs path ans
+    while IFS= read -r line; do mounts+=("$line"); done < <(storage_mounts)
+    ((${#mounts[@]})) || die "no usable writable storage filesystems found"
+    printf 'Available writable destinations:\n\n' >&2
+    for line in "${mounts[@]}"; do
+      path=${line%%$'\t'*}; fs=${line#*$'\t'}
+      [[ -d $path && -w $path && -x $path ]] || continue
+      i=$((i+1)); free=$(df -PB1 "$path" | awk 'NR==2{print $4}'); name=$(basename "$path")
+      printf '%s.\n%s\n\nFilesystem:\n%s\n\nFree:\n%s\n\nPath:\n%s\n\n' "$i" "$name" "$fs" "$(human_bytes "$free")" "$path" >&2
+    done
+    printf 'Destination (number or path): ' >&2; read -r ans
+    if [[ $ans =~ ^[0-9]+$ ]]; then line=${mounts[$((ans-1))]:-}; DEST=${line%%$'\t'*}; else DEST=$ans; fi
   fi
   DEST=$(canon "$DEST") || die "destination invalid: $DEST"
   [[ -d $DEST && -w $DEST && -x $DEST ]] || die "destination must be writable/searchable directory"
@@ -86,22 +118,54 @@ validate_space(){
   avail=$(df -PB1 "$DEST" | awk 'NR==2{print $4}') || die "cannot determine destination free space"
   (( avail >= need )) || die "insufficient destination space: need $need bytes, available $avail bytes"
 }
+add_exclusion(){
+  local c="$1" keep=() e
+  c=$(canon "$c") || die "exclusion invalid: $c"; inside_root "$c" || die "exclusion outside scan root: $c"
+  for e in "${EXCLUSIONS[@]}"; do
+    [[ $e == "$c" ]] && return 0
+    [[ $c == "$e"/* ]] && return 0
+    [[ $e == "$c"/* ]] || keep+=("$e")
+  done
+  EXCLUSIONS=("${keep[@]}" "$c")
+}
+gui_pick_folder(){
+  local title="Select folder to exclude" p=""
+  if command -v zenity >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then p=$(zenity --file-selection --directory --title="$title" 2>/dev/null || true)
+  elif command -v kdialog >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then p=$(kdialog --getexistingdirectory "$SCAN_ROOT" --title "$title" 2>/dev/null || true)
+  elif command -v yad >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then p=$(yad --file-selection --directory --title="$title" 2>/dev/null || true)
+  fi
+  [[ -n $p ]] && printf '%s\n' "$p"
+}
 build_exclusions(){
-  EXCLUSIONS=(); [[ -z $EXCLUSIONS_RAW ]] && return 0
-  local IFS=',' e c seen
-  for e in $EXCLUSIONS_RAW; do
-    [[ -n $e ]] || die "empty exclusion"
-    c=$(canon "$e") || die "exclusion invalid: $e"
-    [[ $c == "$SCAN_ROOT" || $c == "$SCAN_ROOT"/* ]] || die "exclusion outside scan root: $c"
-    for seen in "${EXCLUSIONS[@]:-}"; do [[ $seen == "$c" ]] && die "duplicate exclusion: $c"; done
-    EXCLUSIONS+=("$c")
+  EXCLUSIONS=()
+  if [[ -n $EXCLUSIONS_RAW ]]; then
+    local IFS=',' e; for e in $EXCLUSIONS_RAW; do [[ -n $e ]] || die "empty exclusion"; add_exclusion "$e"; done
+  fi
+  [[ $NONINTERACTIVE -eq 1 ]] && return 0
+  yes_no "Would you like to exclude folders?" || return 0
+  local pick ans
+  while true; do
+    pick=$(gui_pick_folder || true)
+    if [[ -z $pick ]]; then
+      printf 'File Explorer inaccessible.\nFalling back to text mode.\n' >&2
+      printf 'Folder to exclude (inside %s): ' "$SCAN_ROOT" >&2; read -r pick
+    fi
+    [[ -n $pick ]] && add_exclusion "$pick"
+    printf 'Added exclusions:\n\n' >&2; printf '%s\n' "${EXCLUSIONS[@]:-(none)}" >&2; printf '\n' >&2
+    yes_no "Continue adding exclusions?" || break
   done
 }
-
+ask_target_size(){
+  [[ $NONINTERACTIVE -eq 1 || $TARGET_BYTES -ne 0 ]] && return 0
+  local ans; printf 'Target evacuation size\n\nExamples:\n40G\n120G\n0 (everything)\n\n> ' >&2; read -r ans
+  TARGET_BYTES=$(parse_size "$ans")
+}
 # ---------- metadata / manifest ----------
 manifest_sha(){ (cd "$1" && sha256sum manifest.json | awk '{print $1}'); }
 verify_manifest(){ local dir="$1"; [[ -r $dir/manifest.json && -r $dir/manifest.sha256 && -r $dir/manifest.json.gz ]] || return 1; (cd "$dir" && sha256sum -c manifest.sha256 >/dev/null) && gzip -t "$dir/manifest.json.gz"; }
 manifest_value(){ sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1/manifest.json" | head -1; }
+manifest_bool(){ sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([01]\).*/\1/p" "$1/manifest.json" | head -1; }
+manifest_num(){ sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1/manifest.json" | head -1; }
 state_write(){ local dir="$1" state="$2"; printf '{"session":"%s","state":"%s","time":"%s"}\n' "$(basename "$dir")" "$state" "$(ts)" | atomic_write "$dir/state.json"; }
 metadata_sync_to_usb(){
   local local_dir usb meta f
@@ -120,16 +184,53 @@ scan_files(){
   fi
   args+=(-type f); [[ $MIN_BYTES -gt 0 ]] && args+=(-size +$((MIN_BYTES-1))c); args+=(-printf '%s\t%p\n')
   find "${args[@]}" | sort -rn >"$out"
+  SCAN_COUNT=$(awk 'END{print NR+0}' "$out"); SCAN_TOTAL=$(awk -F'\t' '{s+=$1} END{print s+0}' "$out")
+  SCAN_DIRS=$(awk -F'\t' '{d=$2; sub("/[^/]*$","",d); seen[d]=1} END{for(d in seen)c++; print c+0}' "$out")
+  TINY_COUNT=$(awk -F'\t' '$1 < 65536{c++} END{print c+0}' "$out"); TINY_BYTES=$(awk -F'\t' '$1 < 65536{s+=$1} END{print s+0}' "$out")
 }
 select_files(){
-  local scan="$1" selected="$2" total_ref="$3" count_ref="$4" total=0 count=0 size path
+  local scan="$1" selected="$2" total_ref="$3" count_ref="$4" total=0 count=0
   : >"$selected"
-  while IFS=$'\t' read -r size path; do
-    [[ -n ${size:-} ]] || continue
-    printf '%s\t%s\n' "$size" "$path" >>"$selected"; total=$((total+size)); count=$((count+1))
-    [[ $TARGET_BYTES -gt 0 && $total -ge $TARGET_BYTES ]] && break
-  done <"$scan"
-  SELECT_TOTAL="$total"; SELECT_COUNT="$count"
+  if [[ $TARGET_BYTES -eq 0 ]]; then
+    cp -- "$scan" "$selected"
+  else
+    # Best-fit hybrid: exact/near-exact dynamic programming for modest candidate sets,
+    # then a deterministic greedy fill over remaining files. This is substantially
+    # better than taking the first files until the target is reached while staying
+    # practical for shell and large manifests.
+    awk -F'\t' -v target="$TARGET_BYTES" '
+      NR<=3500 && $1<=target {n++; sz[n]=$1; path[n]=$2; next} {late[++m]=$0}
+      END{
+        best=0; pick[0]=""
+        for(i=1;i<=n;i++){
+          lim=best; for(s=lim;s>=0;s--) if((s==0 || pick[s] != "") && s+sz[i]<=target && pick[s+sz[i]]==""){
+            pick[s+sz[i]]=pick[s] i ","; if(s+sz[i]>best) best=s+sz[i]
+          }
+        }
+        split(pick[best], ids, ","); for(k in ids) if(ids[k]){used[ids[k]]=1; print sz[ids[k]] "\t" path[ids[k]]; total+=sz[ids[k]]}
+        for(i=1;i<=n;i++) if(!used[i] && total+sz[i]<=target){print sz[i] "\t" path[i]; total+=sz[i]}
+        for(i=1;i<=m;i++){split(late[i], a, "\t"); if(total+a[1]<=target){print late[i]; total+=a[1]}}
+      }' "$scan" >"$selected"
+  fi
+  SELECT_TOTAL=$(awk -F'\t' '{s+=$1} END{print s+0}' "$selected"); SELECT_COUNT=$(awk 'END{print NR+0}' "$selected")
+}
+analyze_manifest_selection(){
+  local selected="$1"
+  printf '\nManifest analysis\n' >&2
+  printf 'Total files: %s\nTotal directories: %s\nTotal bytes: %s\n' "$SELECT_COUNT" "$SCAN_DIRS" "$(human_bytes "$SELECT_TOTAL")" >&2
+  printf '\nLargest files:\n' >&2; head -5 "$selected" | awk -F'\t' '{printf "  %s  %s\n", $1, $2}' >&2
+  local avg=0; [[ $SELECT_COUNT -gt 0 ]] && avg=$((SELECT_TOTAL/SELECT_COUNT))
+  printf '\nSmall file count (<64 KiB): %s\nAverage size: %s\n' "$TINY_COUNT" "$(human_bytes "$avg")" >&2
+  printf '\nDistribution by size buckets:\n' >&2
+  awk -F'\t' '{if($1<65536)a++; else if($1<1048576)b++; else if($1<1073741824)c++; else d++} END{printf "  <64 KiB: %d\n  64 KiB-1 MiB: %d\n  1 MiB-1 GiB: %d\n  >=1 GiB: %d\n",a+0,b+0,c+0,d+0}' "$selected" >&2
+}
+ask_tiny_optimization(){
+  [[ $NONINTERACTIVE -eq 1 ]] && return 0
+  if [[ $TINY_COUNT -gt 1000 || ( $SELECT_COUNT -gt 0 && $((TINY_COUNT*100/SELECT_COUNT)) -ge 40 ) ]]; then
+    local slowdown; slowdown=$(awk -v t="$TINY_COUNT" -v c="$SELECT_COUNT" 'BEGIN{printf "%.1f", 1+(c?4*t/c:0)}')
+    printf '\nTiny files detected\n\n<64 KiB:\n%s\n\nEstimated slowdown:\n%s×\n\n' "$TINY_COUNT" "$slowdown" >&2
+    yes_no "Enable tiny-file optimization?" && TINY_OPT=1 || TINY_OPT=0
+  fi
 }
 write_manifest_header(){
   local dir="$1" count="$2" total="$3" dest_uuid e sep=""
@@ -138,15 +239,15 @@ write_manifest_header(){
     printf '{\n  "manifest_version": %s,\n  "session_uuid": "%s",\n' "$VERSION" "$(basename "$dir")"
     printf '  "hostname": "%s",\n  "created_utc": "%s",\n' "$(json_escape "$(hostname)")" "$(ts)"
     printf '  "scan_root": "%s",\n  "destination_fs_uuid": "%s",\n' "$(json_escape "$SCAN_ROOT")" "$(json_escape "$dest_uuid")"
-    printf '  "mode": "%s",\n  "file_count": %s,\n  "total_bytes": %s,\n  "exclusions": [' "$MODE" "$count" "$total"
+    printf '  "mode": "%s",\n  "tiny_file_optimization": %s,\n  "file_count": %s,\n  "total_bytes": %s,\n  "exclusions": [' "$MODE" "$TINY_OPT" "$count" "$total"
     if ((${#EXCLUSIONS[@]})); then for e in "${EXCLUSIONS[@]}"; do printf '%s"%s"' "$sep" "$(json_escape "$e")"; sep=', '; done; fi
     printf '],\n  "files": [\n'
   } >"$dir/manifest.json"
 }
 append_manifest_files(){
-  local dir="$1" selected="$2" id=0 comma="" size path ext stored perm owner group mtime sha
+  local dir="$1" selected="$2" id=0 comma="" size path base ext stored perm owner group mtime sha
   while IFS=$'\t' read -r size path; do
-    id=$((id+1)); ext="${path##*.}"; [[ $ext == "$path" ]] && ext=""
+    id=$((id+1)); base=$(basename -- "$path"); ext="${base##*.}"; [[ $ext == "$base" ]] && ext=""
     [[ -n $ext ]] && stored=$(printf '%06d.%s' "$id" "$ext") || stored=$(printf '%06d' "$id")
     perm=$(stat -c '%a' "$path"); owner=$(stat -c '%u' "$path"); group=$(stat -c '%g' "$path"); mtime=$(stat -c '%Y' "$path"); sha=$(sha256sum "$path" | awk '{print $1}')
     printf '%s    {"id":%d,"path":"%s","stored":"%s","size":%s,"sha256":"%s","mode":"%s","uid":%s,"gid":%s,"mtime":%s,"extension":"%s"}' "$comma" "$id" "$(json_escape "$path")" "$(json_escape "$stored")" "$size" "$sha" "$perm" "$owner" "$group" "$mtime" "$(json_escape "$ext")" >>"$dir/manifest.json"
@@ -157,7 +258,7 @@ append_manifest_files(){
 create_manifest(){
   local dir="$1" scan="$dir/scan.tsv" selected="$dir/selected.tsv" total count
   [[ ! -e $dir/manifest.json ]] || die "manifest already exists; refusing to rewrite immutable manifest"
-  select_files "$scan" "$selected" total count; total="$SELECT_TOTAL"; count="$SELECT_COUNT"; validate_space "$total"
+  select_files "$scan" "$selected" total count; total="$SELECT_TOTAL"; count="$SELECT_COUNT"; analyze_manifest_selection "$selected"; ask_tiny_optimization; validate_space "$total"
   write_manifest_header "$dir" "$count" "$total"; append_manifest_files "$dir" "$selected"
   gzip -c "$dir/manifest.json" >"$dir/manifest.json.gz"; (cd "$dir" && sha256sum manifest.json >manifest.sha256)
   verify_manifest "$dir" || die "manifest verification failed"
@@ -188,6 +289,52 @@ file_line(){ grep -m1 '"id":'"$2"',' "$1"; }
 file_field(){ local line; line=$(file_line "$1" "$2"); sed -n 's/.*"'"$3"'":"\([^"]*\)".*/\1/p' <<<"$line"; }
 file_num(){ local line; line=$(file_line "$1" "$2"); sed -n 's/.*"'"$3"'":\([0-9]*\).*/\1/p' <<<"$line"; }
 
+
+create_directory_skeleton(){
+  local dir="$1" mf="$dir/manifest.json" id path rel d
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  while IFS= read -r id; do
+    path=$(file_field "$mf" "$id" path); rel=$(rel_path "$path"); d=$(dirname -- "$rel")
+    [[ $d == "." ]] || mkdir -p -- "$DEST/$d"
+  done < <(manifest_ids "$mf")
+  fsync_path "$DEST"
+}
+estimate_duration(){ local bytes="$1"; awk -v b="$bytes" 'BEGIN{rate=40*1024*1024; s=b/rate; if(s<1)s=1; printf "%.0f seconds at 40 MiB/s", s}'; }
+preflight_report(){
+  local dir="$1" avail; avail=$(df -PB1 "$DEST" | awk 'NR==2{print $4}')
+  printf '\nPre-flight report\n' >&2
+  printf 'Source: %s\nDestination: %s\nSelected files: %s\nExcluded folders: %s\nRequested size: %s\nActual selected size: %s\nEstimated transfer duration: %s\nDestination free space: %s\nManifest version: %s\nResume enabled: Yes\nVerification enabled: Yes\nTransaction mode: %s\n' \
+    "$SCAN_ROOT" "$DEST" "$SELECT_COUNT" "${#EXCLUSIONS[@]}" "$(human_bytes "$TARGET_BYTES")" "$(human_bytes "$SELECT_TOTAL")" "$(estimate_duration "$SELECT_TOTAL")" "$(human_bytes "$avail")" "$VERSION" "$MODE" >&2
+  ((${#EXCLUSIONS[@]})) && printf 'Excluded folders:\n%s\n' "${EXCLUSIONS[*]}" >&2
+  [[ $NONINTERACTIVE -eq 1 ]] || yes_no "Proceed?" || die "aborted before transfer"
+}
+is_tiny_id(){ local mf="$1" id="$2" size; size=$(file_num "$mf" "$id" size); [[ ${size:-0} -lt 65536 ]]; }
+process_tiny_bundle(){
+  local dir="$1" mf="$dir/manifest.json" enabled state list bundle dest_uuid id path
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  enabled=$(manifest_bool "$dir" tiny_file_optimization); [[ $enabled == 1 ]] || return 0
+  state=$(file_state "$dir/progress.jsonl" 0); [[ $state == finished ]] && return 0
+  dest_uuid=$(manifest_value "$dir" destination_fs_uuid); wait_dest "$DEST" "$dest_uuid"
+  mkdir -p "$dir/bundles" "$DEST/bundles"; list="$dir/bundles/tiny-files.list"; : >"$list"
+  while IFS= read -r id; do if is_tiny_id "$mf" "$id"; then path=$(file_field "$mf" "$id" path); rel_path "$path" >>"$list"; fi; done < <(manifest_ids "$mf")
+  [[ -s $list ]] || return 0
+  [[ -z $state ]] && journal_append "$dir" 0 queued && state=queued
+  [[ $state == queued || $state == copying ]] && { journal_append "$dir" 0 copying; (cd "$SCAN_ROOT" && tar --format=posix --acls --xattrs -cpf "$DEST/bundles/tiny-$(basename "$dir").tar" -T "$list"); fsync_path "$DEST/bundles/tiny-$(basename "$dir").tar"; journal_append "$dir" 0 copied; state=copied; }
+  [[ $state == copied ]] && { tar -tf "$DEST/bundles/tiny-$(basename "$dir").tar" >/dev/null; journal_append "$dir" 0 verified; state=verified; }
+  if [[ $state == verified ]]; then
+    while IFS= read -r id; do if is_tiny_id "$mf" "$id"; then journal_append "$dir" "$id" queued; journal_append "$dir" "$id" copying ',"bundle":"tiny"'; journal_append "$dir" "$id" copied ',"bundle":"tiny"'; journal_append "$dir" "$id" verified ',"bundle":"tiny"'; journal_append "$dir" "$id" deleted ',"deferred":true,"bundle":"tiny"'; journal_append "$dir" "$id" finished ',"bundle":"tiny"'; fi; done < <(manifest_ids "$mf")
+    journal_append "$dir" 0 deleted ',"bundle":"tiny"'; journal_append "$dir" 0 finished
+  fi
+  metadata_sync_to_usb "$dir" "$DEST"
+}
+completion_report(){
+  local dir="$1" elapsed files bytes failures skipped journal manifest avg
+  journal="$dir/progress.jsonl"; manifest="$dir/manifest.json"
+  elapsed="${2:-1}"; files=$(awk '/"state":"finished"/ && $0 !~ /"id":0/{c++} END{print c+0}' "$dir/progress.jsonl"); bytes=$(manifest_num "$dir" total_bytes); [[ -z $bytes ]] && bytes=$SELECT_TOTAL; [[ ${SELECT_TOTAL:-0} -eq 0 ]] && SELECT_TOTAL=$bytes
+  failures=$(grep -c 'verify_failed' "$dir/progress.jsonl" || true); skipped=0; avg=$(awk -v b="$SELECT_TOTAL" -v e="$elapsed" 'BEGIN{if(e<1)e=1; printf "%.1f MiB/s", b/e/1048576}')
+  printf '\nCompletion report\nFiles copied: %s\nBytes copied: %s\nVerification results: %s failure(s)\nFailures: %s\nSkipped: %s\nElapsed time: %s seconds\nAverage throughput: %s\nJournal path: %s\nManifest path: %s\nResume session ID: %s\n' "$files" "$(human_bytes "$SELECT_TOTAL")" "$failures" "$failures" "$skipped" "$elapsed" "$avg" "$journal" "$manifest" "$(basename "$dir")" >&2
+}
+
 # ---------- USB / copy engine ----------
 wait_dest(){
   local dest="$1" uuid="$2" current
@@ -215,6 +362,7 @@ process_file(){
   local dir id mf path stored sha dst state dest_uuid
   dir="$1"; id="$2"; mf="$dir/manifest.json"
   state=$(file_state "$dir/progress.jsonl" "$id"); [[ $state == finished ]] && return 0
+  if [[ $(manifest_bool "$dir" tiny_file_optimization) == 1 ]] && is_tiny_id "$mf" "$id"; then return 0; fi
   if [[ $DRY_RUN -eq 1 ]]; then process_dry_run_file "$dir" "$id"; return 0; fi
   [[ -z $state ]] && journal_append "$dir" "$id" queued && state=queued
   path=$(file_field "$mf" "$id" path); stored=$(file_field "$mf" "$id" stored); sha=$(file_field "$mf" "$id" sha256); dst="$DEST/files/$stored"
@@ -236,10 +384,12 @@ transfer(){
   local dir="$1" id dest_uuid
   SESSION_DIR="$dir"; LOG_FILE="$dir/transfer.log"; touch "$dir/progress.jsonl" "$LOG_FILE"
   verify_manifest "$dir" || die "invalid manifest"; validate_journal "$dir"
+  create_directory_skeleton "$dir"; process_tiny_bundle "$dir"
+  local started; started=$(date +%s)
   dest_uuid=$(manifest_value "$dir" destination_fs_uuid); [[ $DEST_UUID == "$dest_uuid" ]] || die "destination UUID mismatch"
   state_write "$dir" transferring; metadata_sync_to_usb "$dir" "$DEST"; log "RESUME session=$(basename "$dir")"
   while IFS= read -r id; do process_file "$dir" "$id"; done < <(manifest_ids "$dir/manifest.json")
-  state_write "$dir" completed; metadata_sync_to_usb "$dir" "$DEST"; log "SESSION_COMPLETED session=$(basename "$dir")"
+  state_write "$dir" completed; metadata_sync_to_usb "$dir" "$DEST"; log "SESSION_COMPLETED session=$(basename "$dir")"; completion_report "$dir" "$(( $(date +%s) - started ))"
 }
 
 # ---------- verification / recovery ----------
@@ -247,8 +397,10 @@ verify_copies(){
   local dir mf files_dir id stored sha
   dir="$1"; mf="$dir/manifest.json"
   verify_manifest "$dir" || die "bad manifest"; files_dir="$(dirname "$dir")/files"; [[ -d $files_dir ]] || files_dir="$dir/../files"
+  if [[ $(manifest_bool "$dir" tiny_file_optimization) == 1 ]]; then local bdir; bdir="$(dirname "$dir")/bundles"; [[ -d $bdir ]] || bdir="$dir/../bundles"; tar -tf "$bdir/tiny-$(basename "$dir").tar" >/dev/null || die "tiny bundle verification failed"; fi
   while IFS= read -r id; do
     stored=$(file_field "$mf" "$id" stored); sha=$(file_field "$mf" "$id" sha256)
+    if [[ $(manifest_bool "$dir" tiny_file_optimization) == 1 ]] && is_tiny_id "$mf" "$id"; then continue; fi
     [[ -f $files_dir/$stored ]] || die "missing copy $stored"
     [[ $(sha256sum "$files_dir/$stored" | awk '{print $1}') == "$sha" ]] || die "checksum mismatch $stored"
   done < <(manifest_ids "$mf")
@@ -258,12 +410,12 @@ resolve_session_dir(){ local base="$HOME/$APP_DIR_NAME" d; d="$base/$1"; [[ -d $
 trap_handler(){ log "INTERRUPT"; [[ -n ${SESSION_DIR:-} ]] && state_write "$SESSION_DIR" interrupted; sync; exit 130; }
 
 main(){
-  require_cmds find findmnt lsblk awk sed sort sha256sum gzip stat df cp sync
+  require_cmds find findmnt lsblk awk sed sort sha256sum gzip stat df cp sync tar
   parse_args "$@"; trap trap_handler INT TERM HUP
   if [[ $VERIFY_ONLY -eq 1 ]]; then local d; d=$(canon "$RESUME_SESSION") || die "verify path invalid"; [[ -d $d/.evacuate ]] && d="$d/.evacuate"; verify_copies "$d"; return 0; fi
   local base="$HOME/$APP_DIR_NAME" session dir; mkdir -p "$base"
   if [[ -n $RESUME_SESSION ]]; then dir=$(resolve_session_dir "$RESUME_SESSION") || die "session not found"; choose_dest; transfer "$dir"; return 0; fi
-  choose_root; choose_dest; build_exclusions; session=$(new_uuid); dir="$base/$session"; mkdir -p "$dir"; SESSION_DIR="$dir"; LOG_FILE="$dir/transfer.log"; : >"$LOG_FILE"
-  scan_files "$dir/scan.tsv"; create_manifest "$dir"; : >"$dir/progress.jsonl"; state_write "$dir" created; metadata_sync_to_usb "$dir" "$DEST"; transfer "$dir"
+  choose_root; build_exclusions; choose_dest; ask_target_size; session=$(new_uuid); dir="$base/$session"; mkdir -p "$dir"; SESSION_DIR="$dir"; LOG_FILE="$dir/transfer.log"; : >"$LOG_FILE"
+  scan_files "$dir/scan.tsv"; create_manifest "$dir"; : >"$dir/progress.jsonl"; state_write "$dir" created; preflight_report "$dir"; metadata_sync_to_usb "$dir" "$DEST"; transfer "$dir"
 }
 main "$@"
