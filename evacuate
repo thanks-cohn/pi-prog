@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+VERSION=1
+APP_DIR_NAME="Pi-Prog"
+DRY_RUN=0
+VERIFY_ONLY=0
+NONINTERACTIVE=0
+SCAN_ROOT=""
+DEST=""
+TARGET_BYTES=0
+MIN_BYTES=0
+MODE="transactional"
+ALLOW_CROSS_FS=0
+EXCLUSIONS_RAW=""
+RESUME_SESSION=""
+YES=0
+
+log(){ printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+die(){ log "ERROR $*" >&2; exit 1; }
+usage(){ cat <<USAGE
+Usage: $0 [options]
+  --root PATH              scan root (required with --non-interactive)
+  --dest PATH              mounted removable destination path
+  --target-size BYTES      bytes to evacuate (0 means all candidates)
+  --min-size BYTES         minimum file size
+  --exclude PATH[,PATH...] excluded directories
+  --mode transactional|incremental
+  --allow-cross-fs         allow crossing filesystem boundaries
+  --dry-run                create and verify metadata but do not copy/delete
+  --verify SESSION_DIR|USB  validate manifest and copied files only
+  --resume SESSION_ID      resume unfinished local session
+  --yes                    assume yes for deletion prompts
+  --non-interactive        fail instead of prompting
+USAGE
+}
+
+json_escape(){ sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' <<<"$1" | tr -d '\r'; }
+canon(){ local p="$1"; [[ $p == ~* ]] && p="${HOME}${p#\~}"; [[ -e $p ]] || return 1; (cd -P -- "$p" 2>/dev/null && pwd -P); }
+parent_canon(){ local p="$1" d b; d=$(dirname -- "$p"); b=$(basename -- "$p"); d=$(canon "$d") || return 1; printf '%s/%s\n' "$d" "$b"; }
+bytes_arg(){ [[ $1 =~ ^[0-9]+$ ]] || die "byte value must be an integer: $1"; printf '%s' "$1"; }
+new_uuid(){ if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid; else date -u +%s%N | sha256sum | awk '{print substr($1,1,8)"-"substr($1,9,4)"-4"substr($1,14,3)"-a"substr($1,18,3)"-"substr($1,21,12)}'; fi; }
+fs_uuid_for(){ local path="$1" src uuid; src=$(findmnt -n -o SOURCE -T "$path") || return 1; uuid=$(lsblk -no UUID "$src" 2>/dev/null | awk 'NF{print; exit}'); [[ -n ${uuid:-} ]] || uuid="SOURCE:$src"; printf '%s\n' "$uuid"; }
+atomic_write(){ local target="$1"; local tmp="${target}.tmp.$$"; cat >"$tmp"; sync "$tmp" 2>/dev/null || sync; mv -f -- "$tmp" "$target"; sync "$(dirname -- "$target")" 2>/dev/null || sync; }
+append_journal(){ local f="$1" line="$2"; printf '%s\n' "$line" >>"$f"; sync "$f" 2>/dev/null || sync; }
+repair_jsonl(){ local f="$1"; [[ -s $f ]] || return 0; if [[ $(tail -c 1 "$f" | wc -l) -eq 0 ]]; then sed -i '$d' "$f"; log "JSONL_REPAIRED $f"; fi; }
+state_write(){ local dir="$1" state="$2"; printf '{"session":"%s","state":"%s","time":"%s"}\n' "$(basename "$dir")" "$state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | atomic_write "$dir/state.json"; }
+metadata_sync_to_usb(){ local l="$1" u="$2"; mkdir -p "$u/.evacuate"; for f in manifest.json manifest.json.gz manifest.sha256 progress.jsonl state.json transfer.log; do [[ -e $l/$f ]] && cp -f "$l/$f" "$u/.evacuate/$f"; done; sync "$u/.evacuate" 2>/dev/null || sync; }
+manifest_sha(){ (cd "$1" && sha256sum manifest.json | awk '{print $1}'); }
+verify_manifest(){ local dir="$1"; [[ -r $dir/manifest.json && -r $dir/manifest.sha256 ]] || return 1; (cd "$dir" && sha256sum -c manifest.sha256 >/dev/null); gzip -t "$dir/manifest.json.gz"; }
+manifest_value(){ sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1/manifest.json" | head -1; }
+
+parse(){ while [[ $# -gt 0 ]]; do case "$1" in --root) SCAN_ROOT=$2; shift 2;; --dest) DEST=$2; shift 2;; --target-size) TARGET_BYTES=$(bytes_arg "$2"); shift 2;; --min-size) MIN_BYTES=$(bytes_arg "$2"); shift 2;; --exclude) EXCLUSIONS_RAW=$2; shift 2;; --mode) MODE=$2; shift 2;; --allow-cross-fs) ALLOW_CROSS_FS=1; shift;; --dry-run) DRY_RUN=1; shift;; --verify) VERIFY_ONLY=1; RESUME_SESSION=$2; shift 2;; --resume) RESUME_SESSION=$2; shift 2;; --yes) YES=1; shift;; --non-interactive) NONINTERACTIVE=1; shift;; -h|--help) usage; exit 0;; *) die "unknown option $1";; esac; done; [[ $MODE == transactional || $MODE == incremental ]] || die "bad mode"; }
+choose_root(){ if [[ -z $SCAN_ROOT ]]; then [[ $NONINTERACTIVE -eq 1 ]] && die "--root required"; printf 'Scan root (Home/Downloads/Videos/Documents,/home,/,Custom path): '; read -r SCAN_ROOT; case "$SCAN_ROOT" in Home) SCAN_ROOT=$HOME;; Downloads) SCAN_ROOT=$HOME/Downloads;; Videos) SCAN_ROOT=$HOME/Videos;; Documents) SCAN_ROOT=$HOME/Documents;; esac; fi; SCAN_ROOT=$(canon "$SCAN_ROOT") || die "scan root invalid"; [[ -r $SCAN_ROOT ]] || die "scan root not readable"; }
+choose_dest(){ if [[ -z $DEST ]]; then [[ $NONINTERACTIVE -eq 1 ]] && die "--dest required"; findmnt -rn -o TARGET,SOURCE,FSTYPE | awk '{print NR ") " $0}'; printf 'Destination mount path: '; read -r DEST; fi; DEST=$(canon "$DEST") || die "destination invalid"; [[ -w $DEST ]] || die "destination not writable"; DEST_UUID=$(fs_uuid_for "$DEST") || die "cannot determine destination filesystem"; }
+build_exclusions(){ EXCLUSIONS=(); [[ -z $EXCLUSIONS_RAW ]] && return 0; local IFS=',' e c seen; for e in $EXCLUSIONS_RAW; do c=$(canon "$e") || die "exclusion invalid: $e"; [[ $c == "$SCAN_ROOT"/* ]] || die "exclusion outside scan root: $c"; for seen in "${EXCLUSIONS[@]:-}"; do [[ $seen == "$c" ]] && die "duplicate exclusion: $c"; done; EXCLUSIONS+=("$c"); done; }
+scan_files(){ local out="$1"; log "SCAN_STARTED"; local args=("$SCAN_ROOT"); [[ $ALLOW_CROSS_FS -eq 0 ]] && args+=(-xdev); if ((${#EXCLUSIONS[@]})); then args+=(\(); local first=1 e; for e in "${EXCLUSIONS[@]}"; do [[ $first -eq 0 ]] && args+=(-o); first=0; args+=(-path "$e"); done; args+=(\) -prune -o); fi; args+=(-type f); [[ $MIN_BYTES -gt 0 ]] && args+=(-size +$((MIN_BYTES-1))c); args+=(-printf '%s\t%p\n'); find "${args[@]}" | sort -rn >"$out"; }
+create_manifest(){ local dir="$1" scan="$dir/scan.tsv" uuid dest_uuid total=0 count=0 selected="$dir/selected.tsv"; uuid=$(basename "$dir"); : >"$selected"; while IFS=$'\t' read -r size path; do [[ -n ${size:-} ]] || continue; printf '%s\t%s\n' "$size" "$path" >>"$selected"; total=$((total+size)); count=$((count+1)); [[ $TARGET_BYTES -gt 0 && $total -ge $TARGET_BYTES ]] && break; done <"$scan"; dest_uuid=$(fs_uuid_for "$DEST"); {
+ printf '{\n  "manifest_version": %s,\n  "session_uuid": "%s",\n  "hostname": "%s",\n  "created_utc": "%s",\n  "scan_root": "%s",\n  "destination_fs_uuid": "%s",\n  "mode": "%s",\n  "exclusions": [' "$VERSION" "$uuid" "$(json_escape "$(hostname)")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "$SCAN_ROOT")" "$(json_escape "$dest_uuid")" "$MODE"
+ local sep="" e; for e in "${EXCLUSIONS[@]}"; do printf '%s"%s"' "$sep" "$(json_escape "$e")"; sep=", "; done; printf '],\n  "files": [\n'
+ local id=0 comma="" size path perm owner group mtime ext sha stored; while IFS=$'\t' read -r size path; do id=$((id+1)); ext="${path##*.}"; if [[ $ext == "$path" ]]; then ext=""; stored=$(printf '%06d' "$id"); else stored=$(printf '%06d.%s' "$id" "$ext"); fi; perm=$(stat -c '%a' "$path"); owner=$(stat -c '%u' "$path"); group=$(stat -c '%g' "$path"); mtime=$(stat -c '%Y' "$path"); sha=$(sha256sum "$path" | awk '{print $1}'); printf '%s    {"id":%d,"path":"%s","stored":"%s","size":%s,"sha256":"%s","mode":"%s","uid":%s,"gid":%s,"mtime":%s,"extension":"%s"}' "$comma" "$id" "$(json_escape "$path")" "$(json_escape "$stored")" "$size" "$sha" "$perm" "$owner" "$group" "$mtime" "$(json_escape "$ext")"; comma=",\n"; done <"$selected"; printf '\n  ]\n}\n'; } >"$dir/manifest.json"
+ gzip -c "$dir/manifest.json" >"$dir/manifest.json.gz"; (cd "$dir" && sha256sum manifest.json > manifest.sha256); verify_manifest "$dir" || die "manifest verification failed"; log "MANIFEST_CREATED $count files $total bytes"; }
+ids_with_state(){ local journal="$1" state="$2"; [[ -f $journal ]] || return 0; awk -v s="\"state\":\"$state\"" '$0 ~ s { if (match($0,/"id":[0-9]+/)) { print substr($0,RSTART+5,RLENGTH-5) } }' "$journal" | sort -n -u; }
+file_field(){ local mf="$1" id="$2" field="$3"; grep -m1 '"id":'"$id"',' "$mf" | sed -n 's/.*"'"$field"'":"\([^"]*\)".*/\1/p'; }
+file_num(){ local mf="$1" id="$2" field="$3"; grep -m1 '"id":'"$id"',' "$mf" | sed -n 's/.*"'"$field"'":\([0-9]*\).*/\1/p'; }
+wait_dest(){ local dest="$1" uuid="$2"; while true; do if [[ -d $dest ]] && [[ $(fs_uuid_for "$dest" 2>/dev/null || true) == "$uuid" ]]; then return 0; fi; log "USB_REMOVED waiting"; sleep 5; done; }
+transfer(){ local dir="$1" usb="$DEST" mf="$dir/manifest.json" journal="$dir/progress.jsonl" uuid dest_uuid id path stored srcsha dst size; dest_uuid=$(manifest_value "$dir" destination_fs_uuid); mkdir -p "$usb/files"; touch "$journal" "$dir/transfer.log"; repair_jsonl "$journal"; state_write "$dir" transferring; metadata_sync_to_usb "$dir" "$usb"; grep '"id":' "$mf" | while read -r line; do id=$(sed -n 's/.*"id":\([0-9]*\).*/\1/p' <<<"$line"); if ids_with_state "$journal" finished | grep -qx "$id"; then continue; fi; path=$(file_field "$mf" "$id" path); stored=$(file_field "$mf" "$id" stored); srcsha=$(file_field "$mf" "$id" sha256); dst="$usb/files/$stored"; if [[ $DRY_RUN -eq 1 ]]; then append_journal "$journal" "{\"id\":$id,\"state\":\"finished\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; continue; fi; wait_dest "$usb" "$dest_uuid"; append_journal "$journal" "{\"id\":$id,\"state\":\"copying\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; cp -p -- "$path" "$dst"; sync "$dst" 2>/dev/null || sync; append_journal "$journal" "{\"id\":$id,\"state\":\"copied\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; if [[ $(sha256sum "$dst" | awk '{print $1}') != "$srcsha" || $(sha256sum "$path" | awk '{print $1}') != "$srcsha" ]]; then rm -f -- "$dst"; append_journal "$journal" "{\"id\":$id,\"state\":\"verify_failed\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; die "verification failed for $path"; fi; append_journal "$journal" "{\"id\":$id,\"state\":\"verified\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; metadata_sync_to_usb "$dir" "$usb"; if [[ $MODE == incremental ]]; then rm -f -- "$path"; append_journal "$journal" "{\"id\":$id,\"state\":\"deleted\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; else append_journal "$journal" "{\"id\":$id,\"state\":\"deleted\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"deferred\":true}"; fi; metadata_sync_to_usb "$dir" "$usb"; append_journal "$journal" "{\"id\":$id,\"state\":\"finished\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"; done; state_write "$dir" completed; metadata_sync_to_usb "$dir" "$usb"; log "SESSION_COMPLETED"; }
+verify_copies(){ local dir="$1"; local mf="$dir/manifest.json" base="$dir" files_dir id stored srcsha; verify_manifest "$dir" || die "bad manifest"; files_dir="$(dirname "$dir")/files"; [[ -d $files_dir ]] || files_dir="$dir/../files"; grep '"id":' "$mf" | while read -r line; do id=$(sed -n 's/.*"id":\([0-9]*\).*/\1/p' <<<"$line"); stored=$(file_field "$mf" "$id" stored); srcsha=$(file_field "$mf" "$id" sha256); [[ -f $files_dir/$stored ]] || die "missing copy $stored"; [[ $(sha256sum "$files_dir/$stored"|awk '{print $1}') == "$srcsha" ]] || die "checksum mismatch $stored"; done; log "VERIFY_OK"; }
+main(){ parse "$@"; trap 'log INTERRUPT; sync; exit 130' INT TERM HUP; if [[ $VERIFY_ONLY -eq 1 ]]; then d=$(canon "$RESUME_SESSION") || die "verify path invalid"; [[ -d $d/.evacuate ]] && d="$d/.evacuate"; verify_copies "$d"; exit 0; fi; local base="$HOME/$APP_DIR_NAME" session dir; mkdir -p "$base"; if [[ -n $RESUME_SESSION ]]; then session="$RESUME_SESSION"; dir="$base/$session"; [[ -d $dir ]] || dir=$(canon "$RESUME_SESSION") || die "session not found"; verify_manifest "$dir" || die "invalid session"; DEST=${DEST:-}; choose_dest; transfer "$dir"; exit 0; fi; choose_root; choose_dest; build_exclusions; session=$(new_uuid); dir="$base/$session"; mkdir -p "$dir"; scan_files "$dir/scan.tsv"; create_manifest "$dir"; : >"$dir/progress.jsonl"; : >"$dir/transfer.log"; state_write "$dir" created; metadata_sync_to_usb "$dir" "$DEST"; transfer "$dir"; }
+main "$@"
